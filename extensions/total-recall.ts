@@ -1,11 +1,11 @@
 /**
  * pi-total-recall — Pi extension for durable, SQLite-backed fact memory.
  *
- * At the end of every agent cycle (`agent_end`) the extension extracts short
- * facts from the run and stores them through the FastMCP server over MCP. It
- * also registers that server so the model can call `store_fact`,
- * `retrieve_facts`, and `stats` directly, and adds `/recall` and
- * `/recall-stats` commands.
+ * At the end of every agent cycle (`agent_end`) the extension asks the current
+ * model to distill a few short, durable facts from the run, then stores them
+ * through the FastMCP server over MCP. It also registers that server so the
+ * model can call `store_fact`, `retrieve_facts`, and `stats` directly, and adds
+ * `/recall` and `/recall-stats` commands.
  */
 
 import { homedir } from "node:os";
@@ -14,40 +14,66 @@ import { fileURLToPath } from "node:url";
 
 import { McpClient, StdioTransport, type CallToolResult } from "@earendil-works/pi-mcp";
 
-import type {
-  AgentMessage,
-  ExtensionAPI,
-  ExtensionContext,
-} from "./pi-types";
+import type { AgentMessage, ExtensionAPI, ExtensionContext } from "./pi-types";
 
 const SERVER_NAME = "total-recall";
 const DEFAULT_MAX_FACTS = 3;
-const MAX_FACT_LENGTH = 500;
+const MAX_FACT_LENGTH = 200;
 const RETRIEVAL_LIMIT = 5;
+const DISTILL_MAX_MESSAGES = 16;
+const DISTILL_MAX_CHARS_PER_MESSAGE = 800;
+const DISTILL_MAX_TRANSCRIPT_CHARS = 8000;
 
 /**
- * Pure helper: pick up to `max` non-empty user facts, newest first, deduped.
- * Kept separate from the MCP/extension wiring so it is easy to unit test.
+ * Pure helper: build the distillation prompt from a run's messages.
+ * Exported so the prompt contract is unit tested.
  */
-export function extractFacts(
+export function distillPrompt(
   messages: readonly AgentMessage[],
   max: number = DEFAULT_MAX_FACTS,
-): string[] {
-  const facts: string[] = [];
-  const seen = new Set<string>();
-  for (let index = messages.length - 1; index >= 0 && facts.length < max; index -= 1) {
-    const text = messageText(messages[index]).trim();
-    if (!text) continue;
-    const fact = text.slice(0, MAX_FACT_LENGTH);
-    if (seen.has(fact)) continue;
-    seen.add(fact);
-    facts.push(fact);
-  }
-  return facts;
+): string {
+  const transcript = messages
+    .slice(-DISTILL_MAX_MESSAGES)
+    .map((message) => `[${message.role ?? "?"}] ${contentText(message).slice(0, DISTILL_MAX_CHARS_PER_MESSAGE)}`)
+    .filter((line) => line.length > 6)
+    .join("\n")
+    .slice(-DISTILL_MAX_TRANSCRIPT_CHARS);
+  return [
+    "You maintain long-term memory for a coding agent.",
+    `Extract up to ${max} durable, reusable facts from the session transcript below.`,
+    'Each fact must be a short standalone sentence, e.g. "the project uses Java" or "the code follows TDD".',
+    "Only include facts that stay true and useful in a future session.",
+    "Skip tool mechanics, transient errors, and obvious details of the current task.",
+    "Respond with ONLY a JSON array of short strings. If nothing is durable, respond with [].",
+    "",
+    "Transcript:",
+    transcript,
+  ].join("\n");
 }
 
-function messageText(message: AgentMessage | undefined): string {
-  if (!message || message.role !== "user") return "";
+/**
+ * Pure helper: pull a JSON array of strings out of a model response that may be
+ * wrapped in prose or a code fence. Returns [] when nothing usable is found.
+ */
+export function parseDistilledFacts(text: string): string[] {
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start === -1 || end <= start) return [];
+  let value: unknown;
+  try {
+    value = JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function contentText(message: AgentMessage | undefined): string {
+  if (!message) return "";
   const { content } = message;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -63,6 +89,36 @@ function partText(part: unknown): string {
     return typeof text === "string" ? text : "";
   }
   return "";
+}
+
+/** Ask the current model to distill short facts from the run. */
+export async function distillFacts(
+  ctx: ExtensionContext,
+  messages: readonly AgentMessage[],
+  max: number,
+): Promise<string[]> {
+  if (!ctx.model || !ctx.modelRegistry) return [];
+  const response = await ctx.modelRegistry.complete(ctx.model, {
+    systemPrompt: "You extract durable facts as a JSON array of short strings.",
+    messages: [
+      { role: "user", content: distillPrompt(messages, max), timestamp: Date.now() },
+    ],
+  });
+  const text = (response.content ?? [])
+    .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+    .filter((part) => part.length > 0)
+    .join("\n");
+
+  const facts: string[] = [];
+  const seen = new Set<string>();
+  for (const fact of parseDistilledFacts(text)) {
+    const trimmed = fact.slice(0, MAX_FACT_LENGTH);
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    facts.push(trimmed);
+    if (facts.length >= max) break;
+  }
+  return facts;
 }
 
 function projectRoot(): string {
@@ -183,7 +239,13 @@ export default function totalRecall(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    const facts = extractFacts(event.messages ?? []);
+    let facts: string[];
+    try {
+      facts = await distillFacts(ctx, event.messages ?? [], DEFAULT_MAX_FACTS);
+    } catch (error) {
+      notify(ctx, `total-recall distillation failed: ${errorText(error)}`, "warning");
+      return;
+    }
     if (facts.length === 0) return;
     try {
       await withClient(async (client) => {

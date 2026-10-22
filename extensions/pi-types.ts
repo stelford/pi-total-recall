@@ -9,9 +9,36 @@ export interface ExtensionUIContext {
   notify(message: string, level?: "info" | "warning" | "error"): void;
 }
 
+export interface LlmTextPart {
+  type?: string;
+  text?: string;
+}
+
+export interface LlmMessage {
+  role: string;
+  content: string | LlmTextPart[];
+  timestamp?: number;
+}
+
+export interface LlmContext {
+  systemPrompt?: string;
+  messages: LlmMessage[];
+}
+
+export interface LlmAssistantMessage {
+  content?: LlmTextPart[];
+}
+
+/** The subset of Pi's ModelRegistry used for the distillation call. */
+export interface ModelRegistryLike {
+  complete(model: unknown, context: LlmContext): Promise<LlmAssistantMessage>;
+}
+
 export interface ExtensionContext {
   cwd: string;
   ui?: ExtensionUIContext;
+  model?: unknown;
+  modelRegistry?: ModelRegistryLike;
 }
 
 export interface TextPart {

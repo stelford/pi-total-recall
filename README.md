@@ -66,12 +66,19 @@ normalizes that back to a list in `toolData()`.
 Storage happens automatically at the end of each cycle, and on demand.
 
 1. When a run finishes, Pi fires the `agent_end` event with the run's messages.
-2. The extension calls `extractFacts(messages)` (a pure, unit-tested helper) to
-   pull up to 3 non-empty user facts, newest first, deduplicated, each capped at
-   500 characters.
-3. For each fact it opens a short-lived MCP client, calls `store_fact` with
+2. The extension calls `distillFacts(ctx, messages)`, which makes one bounded
+   completion request (`ctx.modelRegistry.complete`) on the current model. The
+   prompt (`distillPrompt`) asks for up to 3 short, durable facts and includes
+   only the last 16 messages, each capped at 800 characters (8 000 characters
+   total), so a long injected skill prompt cannot dominate it.
+3. The response is parsed with `parseDistilledFacts`, which tolerates prose or
+   code fences around the JSON array, drops non-strings, deduplicates, and caps
+   each fact at 200 characters.
+4. For each fact it opens a short-lived MCP client, calls `store_fact` with
    `source: "auto"`, and closes the client. Failures only emit a warning; they
    never break the session.
+
+Example stored facts: `the project uses Java`, `the code follows a TDD workflow`.
 
 The model can also store facts deliberately by calling the `store_fact` tool.
 
@@ -99,22 +106,44 @@ and returns newest first.
 | `TOTAL_RECALL_DB` | `~/.pi/total-recall/facts.db` | SQLite database path. |
 | `TOTAL_RECALL_PYTHON` | `<project>/.venv/bin/python` | Interpreter used to launch `server.py`. |
 
-The extension also supports `extractFacts(messages, max)` in tests, and the
-server accepts `limit` on `retrieve_facts`.
+Distillation uses the current session model (`ctx.model`) through
+`ctx.modelRegistry.complete`, so automatic capture needs a working model with
+valid credentials. The manual `store_fact` tool works without it. The server
+accepts `limit` on `retrieve_facts`.
 
 ## Installing the extension in Pi
 
-Add the extension to your Pi settings, for example in
-`~/.pi/agent/settings.json`:
+This project is a Pi package: `package.json` declares `pi.extensions`, so Pi
+discovers `extensions/total-recall.ts` from the package directory. Install it
+with the package command (use an **absolute** path, or run `pi install .` from
+inside the project directory):
+
+```bash
+pi install /home/stef/work_folder_local/pi/pi-total-recall   # user-global
+pi install -l /home/stef/work_folder_local/pi/pi-total-recall # project-local
+```
+
+`pi list` shows the installed package, `pi remove <path>` uninstalls it, and
+`/reload` picks it up in a running session.
+
+To try it once without changing settings:
+
+```bash
+pi -e /home/stef/work_folder_local/pi/pi-total-recall
+```
+
+Pi loads local packages in place and does **not** run `npm install` for them,
+so the local `npm install` above is required for the extension's runtime
+dependency (`@earendil-works/pi-mcp`).
+
+You can also add the raw extension path by hand in `~/.pi/agent/settings.json`
+(or `.pi/settings.json` with a trusted project):
 
 ```json
 {
-  "extensions": ["/home/stef/work_folder_local/pi/pi-total-recall"]
+  "extensions": ["/home/stef/work_folder_local/pi/pi-total-recall/extensions/total-recall.ts"]
 }
 ```
-
-Pi reads the `pi.extensions` field from `package.json`, so pointing at the
-project directory is enough. After adding or changing it, run `/reload`.
 
 ## Tests (red/green TDD)
 
@@ -122,7 +151,7 @@ Every behavior was written as a failing test first, then implemented.
 
 ```bash
 uv run pytest -q     # facts.py + server.py: store, retrieve, stats, errors
-npm test             # extractFacts + live MCP round-trip over stdio
+npm test             # distillation helpers + live MCP round-trip over stdio
 npm run typecheck    # tsc --noEmit
 ```
 
@@ -130,15 +159,18 @@ npm run typecheck    # tsc --noEmit
   limit, stats, persistence, env-var path.
 - `tests/test_server.py` — the three tools are listed and a store→stats
   round-trip works through FastMCP's in-memory client.
-- `tests/extract.test.ts` — `extractFacts` ordering, filtering, dedupe, limit.
+- `tests/distill.test.ts` — `distillPrompt`, `parseDistilledFacts`, and
+  `distillFacts` (with a fake model registry).
 - `tests/mcp.integration.test.ts` — launches `server.py` over stdio with the same
   client and transport the extension uses.
 
 ## Limitations and notes
 
-- `extractFacts` captures user messages verbatim. It is a learning-grade
-  heuristic, not an LLM extraction step; facts can include anything the user
-  typed. Avoid storing secrets, or add a redaction step.
+- Automatic capture costs one extra model completion per agent cycle. If the
+  model is unavailable or returns no usable array, nothing is stored and a
+  warning is shown.
+- Distillation is only as good as the model's judgment. Review stored facts
+  with `/recall`.
 - Retrieval is substring matching, not semantic search.
 - Each command opens its own short-lived MCP client; simple, but not the most
   efficient for very large stores.
