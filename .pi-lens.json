@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/apmantza/pi-lens/master/docs/schema/pi-lens-config-v1.json",
+  "lsp": {
+    "serverOverrides": {
+      "python": {
+        "initializationOptions": {
+          "pythonPath": "/home/stef/work_folder_local/pi/pi-total-recall/.venv/bin/python"
+        }
+      },
+      "python-jedi": {
+        "initializationOptions": {
+          "workspace": {
+            "environmentPath": "/home/stef/work_folder_local/pi/pi-total-recall/.venv"
+          }
+        }
+      }
+    }
+  }
+}

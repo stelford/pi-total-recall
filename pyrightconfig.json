@@ -1,0 +1,9 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["."],
+  "include": ["."],
+  "exclude": [".venv", "node_modules", ".ruff_cache", "openspec"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}
